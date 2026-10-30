@@ -110,10 +110,15 @@ def detect(h, l, c, v, t, p=P):
 # ───────────── 資料 ─────────────
 def load_universe():
     """從證交所 ISIN 表抓上市/上櫃的股票與 ETF。回傳 {ticker: (名稱, 類型)}"""
+    import io
+    import urllib.request
     uni = {}
     for mode, suffix in ((2, ".TW"), (4, ".TWO")):
         url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
-        df = pd.read_html(url, encoding="ms950")[0]
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        raw = urllib.request.urlopen(req, timeout=60).read()
+        html = raw.decode("cp950", errors="ignore")   # 該頁為 Big5/CP950
+        df = pd.read_html(io.StringIO(html))[0]
         section = ""
         for _, row in df.iterrows():
             a = str(row.iloc[0])

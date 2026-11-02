@@ -7,6 +7,8 @@
   python cup_handle.py scan 2330.TW 0050.TW       # 只掃指定標的
   python cup_handle.py backtest                   # 全市場回測
   python cup_handle.py backtest 2330.TW 0050.TW   # 指定標的回測
+  加上 --market TW|HK|US 切換市場(預設 TW),例如:
+  python cup_handle.py scan --market US
 """
 import sys
 import warnings
@@ -29,8 +31,23 @@ P = dict(
     vol_mult=1.5,        # 突破量 ≥ 50日均量 1.5 倍(圖:約3倍,可調高)
     chase_max=0.05,      # 收盤超過買點 5% 不追
     near_pct=0.03,       # 距買點 3% 內算「接近突破」
-    min_price=10, min_vol=500_000,  # 流動性:股價≥10、20日均量≥500張
 )
+
+# 各市場流動性門檻(避免掃到冷門股)
+MARKET_CFG = {
+    "TW": dict(name="台股", min_price=10, min_vol=500_000),        # 20日均量≥500張
+    "HK": dict(name="港股", min_price=1, min_turnover=20e6),       # 20日均成交額≥2000萬港幣
+    "US": dict(name="美股", min_price=5, min_turnover=10e6),       # 20日均成交額≥1000萬美元
+}
+
+
+def liquid(c, v, market="TW"):
+    cfg = MARKET_CFG[market]
+    if c[-1] < cfg["min_price"]:
+        return False
+    if "min_vol" in cfg:
+        return v[-20:].mean() >= cfg["min_vol"]
+    return (c[-20:] * v[-20:]).mean() >= cfg["min_turnover"]
 
 # ───────────── 停損停利設定 ─────────────
 EXIT = dict(
@@ -108,7 +125,7 @@ def detect(h, l, c, v, t, p=P):
 
 
 # ───────────── 資料 ─────────────
-def load_universe():
+def load_universe_tw():
     """從證交所 ISIN 表抓上市/上櫃的股票與 ETF。回傳 {ticker: (名稱, 類型)}"""
     import io
     import urllib.request
@@ -132,6 +149,32 @@ def load_universe():
     return uni
 
 
+def load_universe_hk():
+    """港股:代號 0001~9999(權證/牛熊證在 10000 以上,自然排除),不存在的由 yfinance 略過。"""
+    return {f"{i:04d}.HK": (f"{i:04d}", "股票") for i in range(1, 10000)}
+
+
+def load_universe_us():
+    """美股:納斯達克官方 nasdaqtraded.txt(含 NYSE/NASDAQ/AMEX 的股票與 ETF)。"""
+    import io
+    import urllib.request
+    url = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqtraded.txt"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    txt = urllib.request.urlopen(req, timeout=60).read().decode("utf-8", errors="ignore")
+    df = pd.read_csv(io.StringIO(txt), sep="|", dtype=str)
+    df = df[(df["Nasdaq Traded"] == "Y") & (df["Test Issue"] == "N")]
+    df = df[df["Symbol"].notna() & ~df["Symbol"].str.contains(r"[\$\^]", regex=True)]
+    bad = df["Security Name"].str.contains(
+        r"\b(?:Warrants?|Rights?|Units?|Preferred)\b", case=False, regex=True, na=False)
+    df = df[~bad]
+    return {r["Symbol"].replace(".", "-"): (r["Security Name"], "ETF" if r["ETF"] == "Y" else "股票")
+            for _, r in df.iterrows()}
+
+
+def load_universe(market="TW"):
+    return {"TW": load_universe_tw, "HK": load_universe_hk, "US": load_universe_us}[market]()
+
+
 def download(tickers, period="2y", batch=100):
     out = {}
     for i in range(0, len(tickers), batch):
@@ -140,7 +183,7 @@ def download(tickers, period="2y", batch=100):
                            auto_adjust=True, threads=True, progress=False)
         for tk in chunk:
             try:
-                d = data[tk] if len(chunk) > 1 else data
+                d = data[tk] if isinstance(data.columns, pd.MultiIndex) else data
                 d = d.dropna(subset=["Close"])
                 if len(d) > 150:
                     out[tk] = d
@@ -156,16 +199,16 @@ def arrays(d):
 
 
 # ───────────── 掃描 ─────────────
-def scan(tickers=None):
-    uni = load_universe() if not tickers else {t: (t, "") for t in tickers}
+def scan(tickers=None, market="TW"):
+    uni = load_universe(market) if not tickers else {t: (t, "") for t in tickers}
     tickers = list(uni)
-    print(f"標的數: {len(tickers)}")
+    print(f"[{MARKET_CFG[market]['name']}] 標的數: {len(tickers)}")
     data = download(tickers)
     rows = []
     for tk, d in data.items():
         o, h, l, c, v = arrays(d)
         t = len(c) - 1
-        if c[t] < P["min_price"] or v[-20:].mean() < P["min_vol"]:
+        if not liquid(c, v, market):
             continue
         sig = detect(h, l, c, v, t)
         if not sig:
@@ -184,9 +227,9 @@ def scan(tickers=None):
         print("今天沒有符合的標的")
         return res
     res = res.sort_values(["狀態", "量比"], ascending=[True, False])
-    res.to_csv("cup_handle_scan.csv", index=False, encoding="utf-8-sig")
+    res.to_csv(f"cup_handle_scan_{market}.csv", index=False, encoding="utf-8-sig")
     print(res.to_string(index=False))
-    print("\n已輸出 cup_handle_scan.csv")
+    print(f"\n已輸出 cup_handle_scan_{market}.csv")
     return res
 
 
@@ -234,13 +277,13 @@ def backtest_one(d, is_etf=False):
     return trades
 
 
-def backtest(tickers=None):
-    uni = load_universe() if not tickers else {t: (t, "") for t in tickers}
+def backtest(tickers=None, market="TW"):
+    uni = load_universe(market) if not tickers else {t: (t, "") for t in tickers}
     data = download(list(uni), period="10y")
     allt = []
     for tk, d in data.items():
         o, h, l, c, v = arrays(d)
-        if v[-20:].mean() < P["min_vol"]:
+        if not liquid(c, v, market):
             continue
         for tr in backtest_one(d, uni[tk][1] == "ETF"):
             tr["代號"] = tk
@@ -249,7 +292,7 @@ def backtest(tickers=None):
         print("沒有交易訊號")
         return
     df = pd.DataFrame(allt)
-    df.to_csv("cup_handle_trades.csv", index=False, encoding="utf-8-sig")
+    df.to_csv(f"cup_handle_trades_{market}.csv", index=False, encoding="utf-8-sig")
     w, lo = df[df["報酬"] > 0], df[df["報酬"] <= 0]
     pf = w["報酬"].sum() / abs(lo["報酬"].sum()) if len(lo) else float("inf")
     print(f"交易數 {len(df)} | 勝率 {len(w)/len(df):.1%} | 平均報酬 {df['報酬'].mean():.2%}")
@@ -259,6 +302,12 @@ def backtest(tickers=None):
 
 
 if __name__ == "__main__":
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "scan"
-    args = sys.argv[2:] or None
-    {"scan": scan, "backtest": backtest}[cmd](args)
+    argv = sys.argv[1:]
+    market = "TW"
+    if "--market" in argv:
+        i = argv.index("--market")
+        market = argv[i + 1].upper()
+        del argv[i:i + 2]
+    cmd = argv[0] if argv else "scan"
+    args = argv[1:] or None
+    {"scan": scan, "backtest": backtest}[cmd](args, market)

@@ -2,13 +2,21 @@ name: Cup Handle Scan
 
 on:
   schedule:
-    - cron: "30 6 * * 1-5"
+    - cron: "30 6 * * 1-5"    # 台股 台灣時間 14:30
+    - cron: "45 8 * * 1-5"    # 港股 香港時間 16:45
+    - cron: "0 22 * * 1-5"    # 美股 收盤後(夏令/冬令都已收盤)
   workflow_dispatch:
+    inputs:
+      market:
+        description: "市場"
+        type: choice
+        default: TW
+        options: [TW, HK, US, ALL]
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -23,11 +31,12 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MARKET: ${{ github.event_name == 'workflow_dispatch' && inputs.market || (github.event.schedule == '30 6 * * 1-5' && 'TW' || (github.event.schedule == '45 8 * * 1-5' && 'HK' || 'US')) }}
         run: python run_scan.py ${{ github.event_name == 'workflow_dispatch' && '--force' || '' }}
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: cup-handle-scan
-          path: cup_handle_scan.csv
+          name: cup-handle-scan-${{ github.run_id }}
+          path: cup_handle_scan_*.csv
           if-no-files-found: ignore
